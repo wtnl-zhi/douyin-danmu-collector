@@ -1,0 +1,13 @@
+# Dependencies and generated output
+node_modules/
+out/
+release/
+work/
+
+# Local Electron runtime data and editor files
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+.DS_Store
+.idea/
+.vscode/
