@@ -3,7 +3,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import { copyFile, mkdir, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
 import * as XLSX from 'xlsx'
@@ -140,12 +140,40 @@ app.whenReady().then(async () => {
   collector.on('danmu', (item) => window?.webContents.send('danmu:new', item)); collector.on('status', (item) => window?.webContents.send('capture:status', item)); collector.on('error', (item) => window?.webContents.send('capture:error', item))
   ipcMain.handle('app:bootstrap', () => ({ settings: store.settings(), sessions: store.sessions(), active: null, dbPath: dbPath() }))
   ipcMain.handle('capture:start', (_event, url: string) => collector.start(url)); ipcMain.handle('capture:stop', () => collector.stop()); ipcMain.handle('sessions:list', () => store.sessions()); ipcMain.handle('messages:list', (_event, args) => store.messages(args.sessionId, args.query, args.from, args.to)); ipcMain.handle('settings:save', (_event, value: Settings) => store.saveSettings(value)); ipcMain.handle('path:openData', () => shell.openPath(dataDir()))
-  ipcMain.handle('export:csv', async (_event, sessionId: string) => exportRows(sessionId, 'csv')); ipcMain.handle('export:xlsx', async (_event, sessionId: string) => exportRows(sessionId, 'xlsx')); ipcMain.handle('export:sqlite', async () => { const pick = await dialog.showSaveDialog({ defaultPath: 'danmu.sqlite' }); if (pick.canceled || !pick.filePath) return null; store.checkpoint(); await copyFile(dbPath(), pick.filePath); return pick.filePath }); ipcMain.handle('wordcloud:create', (_event, args) => wordCloud(args.sessionId, args.minFrequency ?? 2)); ipcMain.handle('wordcloud:export', async (_event, args) => exportWordCloud3dBillboard(args.sessionId, args.minFrequency ?? 2))
+  ipcMain.handle('export:csv', async (_event, sessionId: string) => exportRows(sessionId, 'csv')); ipcMain.handle('export:xlsx', async (_event, sessionId: string) => exportRows(sessionId, 'xlsx')); ipcMain.handle('export:sqlite', async () => { const pick = await dialog.showSaveDialog({ defaultPath: 'danmu.sqlite' }); if (pick.canceled || !pick.filePath) return null; store.checkpoint(); await copyFile(dbPath(), pick.filePath); return pick.filePath }); ipcMain.handle('wordcloud:create', (_event, args) => wordCloud(args.sessionId, args.minFrequency ?? 2)); ipcMain.handle('wordcloud:export', async (_event, args) => exportWordCloudCanvas(args.sessionId, args.minFrequency ?? 2))
 })
 
 async function exportRows(sessionId: string, type: 'csv' | 'xlsx') { const rows = store.messages(sessionId).map((item) => ({ 弹幕时间: new Date(item.sentAtMs).toLocaleString('zh-CN', { hour12: false }), 用户名: item.username, 用户ID: item.userId, 弹幕内容: item.content, 消息ID: item.messageId })); const pick = await dialog.showSaveDialog({ defaultPath: `弹幕-${Date.now()}.${type}` }); if (pick.canceled || !pick.filePath) return null; if (type === 'csv') { const escape = (value: unknown) => `"${String(value ?? '').replaceAll('"', '""')}"`; const headers = ['弹幕时间', '用户名', '用户ID', '弹幕内容', '消息ID']; await writeFile(pick.filePath, `\ufeff${headers.join(',')}\n${rows.map((row) => headers.map((key) => escape(row[key as keyof typeof row])).join(',')).join('\n')}`) } else { const sheet = XLSX.utils.json_to_sheet(rows); const book = XLSX.utils.book_new(); XLSX.utils.book_append_sheet(book, sheet, '弹幕'); XLSX.writeFile(book, pick.filePath) } return pick.filePath }
 
 function wordCloud(sessionId: string, minFrequency: number) { const stop = new Set(['我们','你们','这个','那个','就是','真的','可以','不要','一个','今天','主播','直播间','哈哈','哈哈哈','一下','怎么','什么','他们','还有','已经','没有']); const counts = new Map<string, number>(); for (const item of store.messages(sessionId)) { const chunks = item.content.replace(/https?:\/\/\S+/g, '').match(/[\u4e00-\u9fff]{2,}/g) ?? []; for (const chunk of chunks) for (let i = 0; i < chunk.length - 1; i += 1) { const word = chunk.slice(i, i + 2); if (!stop.has(word)) counts.set(word, (counts.get(word) ?? 0) + 1) } } const words = [...counts.entries()].filter(([, count]) => count >= minFrequency).sort((a, b) => b[1] - a[1]).slice(0, 50).map(([word, count]) => ({ word, count })); const max = Math.max(...words.map((item) => item.count), 1); return { words: words.map((item, index) => ({ ...item, size: Math.round(14 + (item.count / max) * 46), rotate: index % 4 === 0 ? -8 : index % 5 === 0 ? 8 : 0 })) } }
+
+function tagCanvasSource(bundle: string) {
+  const marker = 'var tagCanvasString = '
+  const start = bundle.indexOf(marker)
+  if (start < 0) throw new Error('未找到词云渲染器')
+  const literalStart = start + marker.length
+  if (bundle[literalStart] !== '"') throw new Error('词云渲染器格式异常')
+  let escaped = false
+  for (let index = literalStart + 1; index < bundle.length; index += 1) {
+    const char = bundle[index]
+    if (!escaped && char === '"') return JSON.parse(bundle.slice(literalStart, index + 1)) as string
+    escaped = !escaped && char === '\\'
+    if (char !== '\\') escaped = false
+  }
+  throw new Error('词云渲染器不完整')
+}
+
+async function exportWordCloudCanvas(sessionId: string, minFrequency: number) {
+  const data = wordCloud(sessionId, minFrequency)
+  const pick = await dialog.showSaveDialog({ defaultPath: `弹幕关键词云-${Date.now()}.html` })
+  if (pick.canceled || !pick.filePath) return null
+  const bundle = await readFile(join(app.getAppPath(), 'node_modules', 'react-icon-cloud', 'dist', 'react-icon-cloud.esm.js'), 'utf8')
+  const engine = tagCanvasSource(bundle).replaceAll('</script>', '<\\/script>')
+  const words = JSON.stringify(data.words).replaceAll('<', '\\u003c')
+  const list = data.words.slice(0, 50).map((item, index) => `<tr><td><small>${String(index + 1).padStart(2, '0')}</small>${item.word.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')}</td><td>${item.count}</td></tr>`).join('')
+  await writeFile(pick.filePath, `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>3D 弹幕词云</title><style>*{box-sizing:border-box}body{margin:0;background:#07111f;color:#e9f5ff;font-family:-apple-system,BlinkMacSystemFont,"Noto Sans SC",sans-serif}.wrap{max-width:1160px;margin:auto;padding:42px 28px}.eyebrow{font:12px ui-monospace;color:#65b6ff;letter-spacing:2px}h1{margin:8px 0;font-size:30px}.sub{color:#9abbd7;font-size:13px}.panel{display:grid;grid-template-columns:minmax(0,1fr) 210px;overflow:hidden;border:1px solid #2b4d6d;border-radius:22px;background:#091a2d;box-shadow:0 24px 65px #0006}.stage{position:relative;display:grid;place-items:center;min-height:520px;overflow:hidden;background:radial-gradient(ellipse at center,#164d81,#0b2037 45%,#071525)}.stage:before{content:"";position:absolute;inset:0;background-image:linear-gradient(#b3ddff0c 1px,transparent 1px),linear-gradient(90deg,#b3ddff0c 1px,transparent 1px);background-size:26px 26px;mask-image:radial-gradient(ellipse at center,black,transparent 72%)}.halo{position:absolute;width:min(390px,70%);aspect-ratio:1;border:1px solid #b4e2ff25;border-radius:50%;box-shadow:inset 0 0 90px #5bb2ff20,0 0 0 52px #50acff08,0 0 0 104px #50acff05}.canvas-wrap{position:relative;z-index:1;width:min(460px,86%);aspect-ratio:1}.canvas-wrap canvas{display:block;width:100%!important;height:100%!important;filter:drop-shadow(0 13px 24px #0008)}.hint{position:absolute;z-index:2;bottom:17px;left:18px;color:#80aaca;font-size:10px}.rank{padding:22px;background:#091a2dbd;border-left:1px solid #2b4d6d}.rank h2{font:11px ui-monospace;color:#76b5e8;letter-spacing:1.6px}.rank table{width:100%;border-collapse:collapse;font-size:12px}.rank td{padding:8px 0;border-bottom:1px solid #23415e}.rank td:last-child{text-align:right;color:#62b4ff}@media(max-width:700px){.wrap{padding:22px 14px}.panel{grid-template-columns:1fr}.rank{border-left:0;border-top:1px solid #2b4d6d}}</style><main class="wrap"><p class="eyebrow">LIVE LANGUAGE ORB</p><h1>3D 弹幕词云</h1><p class="sub">Canvas 实时投影 · 高频词突出，低频词随景深自然退场 · ${data.words.length} 个关键词</p><section class="panel"><div class="stage"><i class="halo"></i><div class="canvas-wrap" id="cloud-tags"><canvas id="cloud-canvas" width="860" height="860"></canvas></div><div class="hint">拖动旋转 · 离线可打开</div></div><aside class="rank"><h2>TOP 50</h2><table>${list}</table></aside></section></main><script>${engine}</script><script>const data=${words};const host=document.getElementById('cloud-tags');data.slice(0,54).forEach((item,index)=>{const a=document.createElement('a');a.href='#word-cloud';a.title=item.word+'：'+item.count+' 次';a.dataset.weight=item.count;a.textContent=item.word;a.style.color=['#eaf7ff','#9ed7ff','#67baff','#3d9df4','#c4e7ff','#70c7ff'][index%6];a.style.fontSize=Math.round(14+(item.count/Math.max(data[0]?.count||1,1))*30)+'px';a.style.fontWeight=item.count/(data[0]?.count||1)>.62?'800':'700';host.appendChild(a)});TagCanvas.Start('cloud-canvas','cloud-tags',{shape:'sphere',initial:[.7,-.16],maxSpeed:.028,minSpeed:.003,decel:.97,depth:.92,textColour:'#9ed7ff',textFont:'Noto Sans SC,system-ui,sans-serif',textHeight:16,maxBrightness:1,minBrightness:.2,shadow:'#0a6cc1',shadowBlur:5,shadowOffset:[0,0],outlineMethod:'none',padding:2,weight:true,weightFrom:'data-weight',weightMode:'size',weightSize:1,weightSizeMin:14,weightSizeMax:54,shuffleTags:true,dragControl:true,freezeDecel:true,frontSelect:true,noSelect:true,wheelZoom:false,tooltip:'native'})</script></html>`)
+  return pick.filePath
+}
 async function exportWordCloud(sessionId: string, minFrequency: number) {
   const data = wordCloud(sessionId, minFrequency); const pick = await dialog.showSaveDialog({ defaultPath: `弹幕关键词云-${Date.now()}.html` }); if (pick.canceled || !pick.filePath) return null
   const escape = (value: string) => value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')

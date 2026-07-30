@@ -47,7 +47,7 @@ input:focus { border-color: #5da4ff; box-shadow: 0 0 0 3px #368cff24; }
 .notice { font-size: 13px; color: #8fb1d6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .exports { display: flex; gap: 8px; }
 
-/* Word-cloud composition: a dense blue typographic orb with real CSS 3D rotation. */
+/* Canvas 3D word cloud. TagCanvas projects depth and opacity every frame. */
 .cloud { position: relative; margin: 18px 0; display: grid; grid-template-columns: 245px minmax(0, 1fr) 210px; overflow: hidden; background: linear-gradient(120deg, #0c223a, #09172a 52%, #0c2139); }
 .cloudmeta { position: relative; z-index: 2; padding: 29px 25px; border-right: 1px solid #2b4a68; background: linear-gradient(180deg, #112d4a, #0c1e34); }
 .cloudmeta h2, .history h2 { font-size: 17px; margin: 0; letter-spacing: -.35px; }
@@ -56,20 +56,11 @@ input:focus { border-color: #5da4ff; box-shadow: 0 0 0 3px #368cff24; }
 .cloud-stats { display: grid; gap: 8px; }
 .cloud-stats span { display: flex; justify-content: space-between; color: #83a4c3; font-size: 11px; }
 .cloud-stats b { color: #e4f3ff; font: 500 14px "DM Mono"; }
-.orbstage { position: relative; min-height: 470px; overflow: hidden; isolation: isolate; perspective: 900px; perspective-origin: 50% 46%; background: radial-gradient(ellipse at center, #164d81 0, #0b2037 45%, #071525 100%); }
-.orbstage::before { content: ""; position: absolute; inset: 0; opacity: .38; background-image: linear-gradient(#b3ddff0c 1px, transparent 1px), linear-gradient(90deg, #b3ddff0c 1px, transparent 1px); background-size: 26px 26px; mask-image: radial-gradient(ellipse at center, black, transparent 72%); }
-.orbstage::after { content: ""; position: absolute; width: 390px; height: 390px; top: 38px; left: 50%; border: 1px solid #b4e2ff25; border-radius: 50%; transform: translateX(-50%); box-shadow: inset 0 0 90px #5bb2ff20, 0 0 0 52px #50acff08, 0 0 0 104px #50acff05; }
-.cloudsphere { position: absolute; z-index: 1; left: 50%; top: 47%; width: 0; height: 0; transform-style: preserve-3d; animation: cloud-orbit 32s cubic-bezier(.45, .02, .55, .98) infinite; }
-.orbcore { position: absolute; width: 340px; height: 340px; border: 1px solid #b4e5ff1d; border-radius: 50%; transform: translate3d(-170px, -170px, -18px); background: radial-gradient(circle at 32% 25%, #c3ecff25 0, #65baff14 24%, #0c36700d 56%, transparent 70%); box-shadow: inset -22px -16px 50px #0005, inset 12px 8px 44px #76c8ff16, 0 0 75px #3da7ff24; }
-.orbshadow { position: absolute; z-index: 0; width: 300px; height: 52px; left: 50%; bottom: 32px; border-radius: 50%; transform: translateX(-50%); background: radial-gradient(ellipse, #020914ae 0, #02091440 48%, transparent 72%); filter: blur(7px); }
-.cloudword { position: absolute; left: 0; top: 0; color: #69b9ff; font-weight: 700; line-height: 1; letter-spacing: -.04em; white-space: nowrap; cursor: default; transform-style: preserve-3d; transition: filter .16s ease, opacity .16s ease; }
-.wordface { display: inline-block; text-shadow: 0 1px 0 #061422, 0 0 18px #32a0ff52; transform-style: preserve-3d; backface-visibility: hidden; animation: word-counterorbit 32s cubic-bezier(.45, .02, .55, .98) infinite; }
-.cloudword:nth-child(3n) { color: #9dd3ff; }
-.cloudword:nth-child(4n) { color: #3e9dff; }
-.cloudword.featured { color: #eef8ff; font-weight: 800; text-shadow: 0 1px 0 #0a2c47, 0 0 28px #67bfffaa; }
-.cloudword:hover { filter: brightness(1.32); opacity: 1 !important; z-index: 2; }
-.orbstage:hover .cloudsphere, .orbstage:hover .wordface { animation-play-state: paused; }
-.cloudsphere:has(.cloudword:hover) { animation-play-state: paused; }
+.tagcanvas-stage { position: relative; min-height: 470px; overflow: hidden; isolation: isolate; display: grid; place-items: center; background: radial-gradient(ellipse at center, #164d81 0, #0b2037 46%, #071525 100%); }
+.tagcanvas-stage::before { content: ""; position: absolute; inset: 0; opacity: .38; background-image: linear-gradient(#b3ddff0c 1px, transparent 1px), linear-gradient(90deg, #b3ddff0c 1px, transparent 1px); background-size: 26px 26px; mask-image: radial-gradient(ellipse at center, black, transparent 72%); }
+.tagcanvas-halo { position: absolute; width: min(390px, 70%); aspect-ratio: 1; border: 1px solid #b4e2ff25; border-radius: 50%; box-shadow: inset 0 0 90px #5bb2ff20, 0 0 0 52px #50acff08, 0 0 0 104px #50acff05; pointer-events: none; }
+.tagcanvas-container { position: relative; z-index: 1; width: min(460px, 86%); aspect-ratio: 1; }
+.tagcanvas-canvas { display: block; width: 100% !important; height: 100% !important; filter: drop-shadow(0 13px 24px #0008); }
 .cloudlegend { position: absolute; bottom: 15px; left: 18px; display: flex; gap: 8px; align-items: center; color: #80aaca; font-size: 10px; letter-spacing: .2px; }
 .cloudlegend i { width: 36px; height: 4px; border-radius: 99px; background: linear-gradient(90deg, #237ae6, #d9f1ff); }
 .cloudrank { margin: 0; padding: 22px 20px 18px; list-style: none; border-left: 1px solid #2b4a68; background: #0a192b9e; }
@@ -86,9 +77,5 @@ input:focus { border-color: #5da4ff; box-shadow: 0 0 0 3px #368cff24; }
 .history button span, .history small { color: #8aa8c7; font-size: 11px; }
 .history button b { font-size: 15px; }
 
-@keyframes cloud-orbit { 0% { transform: rotateX(-9deg) rotateY(0deg) rotateZ(-1deg); } 42% { transform: rotateX(12deg) rotateY(152deg) rotateZ(1deg); } 67% { transform: rotateX(-4deg) rotateY(238deg) rotateZ(-2deg); } 100% { transform: rotateX(-9deg) rotateY(360deg) rotateZ(-1deg); } }
-@keyframes word-counterorbit { 0% { transform: translate(-50%, -50%) rotateZ(1deg) rotateY(0deg) rotateX(9deg); } 42% { transform: translate(-50%, -50%) rotateZ(-1deg) rotateY(-152deg) rotateX(-12deg); } 67% { transform: translate(-50%, -50%) rotateZ(2deg) rotateY(-238deg) rotateX(4deg); } 100% { transform: translate(-50%, -50%) rotateZ(1deg) rotateY(-360deg) rotateX(9deg); } }
-@media (prefers-reduced-motion: reduce) { .cloudsphere, .wordface { animation: none; } .wordface { transform: translate(-50%, -50%); } }
-
 @media (max-width: 1050px) { .cloud { grid-template-columns: 225px minmax(0, 1fr); } .cloudrank { display: none; } }
-@media (max-width: 900px) { main { padding: 14px; } .control { grid-template-columns: 1fr; } .metrics { grid-template-columns: repeat(2, 1fr); } .row { grid-template-columns: 80px 1fr 1fr; } .row strong { grid-column: 2 / 5; } .cloud { grid-template-columns: 1fr; } .cloudmeta { border-right: 0; border-bottom: 1px solid #2b4a68; } .cloudmeta button { width: auto; } .orbstage { min-height: 440px; } .bottom { align-items: flex-start; flex-direction: column; } .exports { flex-wrap: wrap; } }
+@media (max-width: 900px) { main { padding: 14px; } .control { grid-template-columns: 1fr; } .metrics { grid-template-columns: repeat(2, 1fr); } .row { grid-template-columns: 80px 1fr 1fr; } .row strong { grid-column: 2 / 5; } .cloud { grid-template-columns: 1fr; } .cloudmeta { border-right: 0; border-bottom: 1px solid #2b4a68; } .cloudmeta button { width: auto; } .tagcanvas-stage { min-height: 440px; } .bottom { align-items: flex-start; flex-direction: column; } .exports { flex-wrap: wrap; } }

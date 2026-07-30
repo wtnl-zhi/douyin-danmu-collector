@@ -10,7 +10,8 @@
 - 实时弹幕列表：时间、用户 ID、用户名、内容；支持搜索、时间范围、暂停显示、ID 脱敏和屏蔽词
 - 历史采集任务浏览
 - CSV（Excel 中文兼容）、XLSX、SQLite 导出
-- 本地蓝色关键词云预览与独立 HTML 导出
+- Canvas 实时投影的蓝色 3D 关键词云：可拖动旋转，词语按景深缩放/淡出，不会翻转到背面
+- 可离线打开的同款 3D HTML 关键词云导出
 - 数据目录、原始帧保存、屏蔽词等本地设置
 
 ## 开发启动
@@ -45,3 +46,7 @@ npm run package
 - `app_settings`：本地显示与采集设置
 
 详细范围、验收标准和未来扩展见同级的《项目开发计划与交付说明.md》。
+
+## 第三方组件
+
+3D 排版使用 [`react-icon-cloud`](https://github.com/teaguestockwell/react-icon-cloud)（MIT）封装的 TagCanvas 2.11 引擎。该引擎按 LGPL-3.0-or-later 提供；其来源和许可说明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
