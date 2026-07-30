@@ -15,6 +15,7 @@ type Settings = { maskIds: boolean; newestFirst: boolean; blockedWords: string[]
 
 const DEFAULT_SETTINGS: Settings = { maskIds: true, newestFirst: true, blockedWords: [], storeRawFrames: true, headlessChrome: true }
 const CDP_PORT = 9223
+const LEGACY_CDP_PORTS = [9222]
 const dataDir = () => join(app.getPath('userData'), 'data')
 const dbPath = () => join(dataDir(), 'danmu.sqlite')
 
@@ -88,16 +89,26 @@ class Store {
 
 class Collector extends EventEmitter {
   private active: { session: Session; stopped: boolean; socket?: WebSocket; retry: number } | null = null
+  private activeCdpPort = CDP_PORT
   constructor(private store: Store) { super() }
   async start(roomUrl: string) {
     if (this.active) throw new Error('已有抓取任务正在运行')
     if (!/^https:\/\/live\.douyin\.com\/\d+/.test(roomUrl)) throw new Error('请输入有效的抖音直播间链接')
+    this.activeCdpPort = CDP_PORT
     const session = this.store.createSession(roomUrl); this.active = { session, stopped: false, retry: 0 }; this.emit('status', this.store.session(session.id)); void this.loop(); return session
   }
   async stop() { if (!this.active) return null; this.active.stopped = true; this.active.socket?.close(); this.store.setSession(this.active.session.id, 'stopped'); const result = this.store.session(this.active.session.id); this.active = null; this.emit('status', result); return result }
+  private debugUrl(port = this.activeCdpPort) { return `http://127.0.0.1:${port}` }
+  private async chromeReady(port: number) { try { return (await fetch(`${this.debugUrl(port)}/json/version`)).ok } catch { return false } }
   private async ensureChrome(roomUrl: string) {
-    const debugUrl = `http://127.0.0.1:${CDP_PORT}`
-    try { if ((await fetch(`${debugUrl}/json/version`)).ok) return } catch { /* start a dedicated profile */ }
+    if (await this.chromeReady(CDP_PORT)) { this.activeCdpPort = CDP_PORT; return }
+    // Builds before 0.1.3 used port 9222 with this exact app profile. Reusing that
+    // live process avoids a Chromium profile-lock collision after an upgrade.
+    for (const legacyPort of LEGACY_CDP_PORTS) {
+      if (await this.chromeReady(legacyPort)) { this.activeCdpPort = legacyPort; return }
+    }
+    this.activeCdpPort = CDP_PORT
+    const debugUrl = this.debugUrl()
     const profile = join(app.getPath('userData'), 'chrome-profile'); await mkdir(profile, { recursive: true })
     const chromeArgs = ['--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', roomUrl]
     if (this.store.settings().headlessChrome) {
@@ -110,7 +121,7 @@ class Collector extends EventEmitter {
     throw new Error('无法启动调试 Chrome，请确认 Google Chrome 已安装')
   }
   private async target(roomUrl: string): Promise<{ webSocketDebuggerUrl: string }> {
-    const debugUrl = `http://127.0.0.1:${CDP_PORT}`
+    const debugUrl = this.debugUrl()
     const tabs = await (await fetch(`${debugUrl}/json/list`)).json() as Array<{ type: string; url: string; webSocketDebuggerUrl?: string }>
     let tab = tabs.find((item) => item.type === 'page' && item.url.includes('live.douyin.com'))
     if (!tab) { await fetch(`${debugUrl}/json/new?${encodeURIComponent(roomUrl)}`, { method: 'PUT' }); await new Promise((resolve) => setTimeout(resolve, 1000)); return this.target(roomUrl) }
@@ -124,11 +135,13 @@ class Collector extends EventEmitter {
       if (active && !active.stopped) await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * 2 ** active.retry, 30000)))
     }
   }
-  private attach(url: string) { return new Promise<void>((resolve) => {
-    if (!this.active) return resolve(); const socket = new WebSocket(url); this.active.socket = socket; let nextId = 1
-    socket.addEventListener('open', () => socket.send(JSON.stringify({ id: nextId++, method: 'Network.enable' })))
-    socket.addEventListener('message', ({ data }) => { const payload = JSON.parse(String(data)); if (payload.method !== 'Network.webSocketFrameReceived' || !this.active) return; const frame = payload.params.response; if (frame.opcode !== 2) return; const bytes = Buffer.from(frame.payloadData, 'base64'); const rawFrameId = this.store.addFrame(this.active.session.id, bytes, this.store.settings().storeRawFrames); const saved = this.store.addMessages(this.active.session.id, decodeDanmu(bytes), rawFrameId); for (const item of saved) this.emit('danmu', item) })
-    socket.addEventListener('close', () => resolve()); socket.addEventListener('error', () => resolve())
+  private attach(url: string) { return new Promise<void>((resolve, reject) => {
+    if (!this.active) return resolve(); const socket = new WebSocket(url); this.active.socket = socket; let nextId = 1; let opened = false; let settled = false
+    const finish = (error?: Error) => { if (settled) return; settled = true; error ? reject(error) : resolve() }
+    socket.addEventListener('open', () => { opened = true; socket.send(JSON.stringify({ id: nextId++, method: 'Network.enable' })) })
+    socket.addEventListener('message', ({ data }) => { try { const payload = JSON.parse(String(data)); if (payload.method !== 'Network.webSocketFrameReceived' || !this.active) return; const frame = payload.params.response; if (frame.opcode !== 2) return; const bytes = Buffer.from(frame.payloadData, 'base64'); const rawFrameId = this.store.addFrame(this.active.session.id, bytes, this.store.settings().storeRawFrames); const saved = this.store.addMessages(this.active.session.id, decodeDanmu(bytes), rawFrameId); for (const item of saved) this.emit('danmu', item) } catch (error) { finish(new Error(`WebSocket 帧处理失败：${error instanceof Error ? error.message : String(error)}`)) } })
+    socket.addEventListener('close', () => finish(opened ? undefined : new Error('无法连接 Chrome DevTools WebSocket')))
+    socket.addEventListener('error', () => finish(new Error('Chrome DevTools WebSocket 连接异常')))
   }) }
 }
 
