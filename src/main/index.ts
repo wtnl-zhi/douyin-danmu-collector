@@ -106,7 +106,7 @@ class Collector extends EventEmitter {
   async start(roomUrl: string) {
     if (this.active) throw new Error('已有抓取任务正在运行')
     if (!/^https:\/\/live\.douyin\.com\/\d+/.test(roomUrl)) throw new Error('请输入有效的抖音直播间链接')
-    const session = this.store.createSession(roomUrl); this.active = { session, stopped: false, retry: 0 }; this.emit('status', this.store.session(session.id)); void this.loop(); return session
+    const session = this.store.createSession(roomUrl); this.active = { session, stopped: false, retry: 0 }; this.emit('status', this.store.session(session.id)); setTimeout(() => void this.loop(), 0); return session
   }
   async stop() {
     if (!this.active) return null
