@@ -38,11 +38,10 @@ function fields(buffer: Buffer): ProtoField[] {
 const bytesAt = (items: ProtoField[], field: number) => items.find((item) => item.field === field)?.bytes
 const valueAt = (items: ProtoField[], field: number) => items.find((item) => item.field === field)?.value
 
-function decodeDanmu(frameBytes: Buffer): Omit<Danmu, 'id' | 'sessionId' | 'receivedAtMs'>[] {
+type DecodedDanmu = Omit<Danmu, 'id' | 'sessionId' | 'receivedAtMs'>
+
+function decodeWebcastResponse(raw: Buffer): DecodedDanmu[] {
   try {
-    const frame = fields(frameBytes); const payload = bytesAt(frame, 8); if (!payload) return []
-    const header = frame.filter((item) => item.field === 5 && item.bytes).map((item) => fields(item.bytes!)).find((item) => bytesAt(item, 1)?.toString() === 'compress_type')
-    const raw = bytesAt(header ?? [], 2)?.toString() === 'gzip' ? gunzipSync(payload) : payload
     const response = fields(raw); const result: Omit<Danmu, 'id' | 'sessionId' | 'receivedAtMs'>[] = []
     for (const item of response) {
       if (item.field !== 1 || !item.bytes) continue
@@ -57,6 +56,20 @@ function decodeDanmu(frameBytes: Buffer): Omit<Danmu, 'id' | 'sessionId' | 'rece
     }
     return result
   } catch { return [] }
+}
+
+function decodeDanmu(frameBytes: Buffer): DecodedDanmu[] {
+  try {
+    const frame = fields(frameBytes); const payload = bytesAt(frame, 8); if (!payload) return []
+    const header = frame.filter((item) => item.field === 5 && item.bytes).map((item) => fields(item.bytes!)).find((item) => bytesAt(item, 1)?.toString() === 'compress_type')
+    const raw = bytesAt(header ?? [], 2)?.toString() === 'gzip' ? gunzipSync(payload) : payload
+    return decodeWebcastResponse(raw)
+  } catch { return [] }
+}
+
+function decodeHttpDanmu(body: Buffer): DecodedDanmu[] {
+  const direct = decodeWebcastResponse(body)
+  return direct.length ? direct : decodeDanmu(body)
 }
 
 class Store {
@@ -75,7 +88,7 @@ class Store {
   createSession(roomUrl: string): Session { const now = Date.now(); const id = randomUUID(); const roomId = roomUrl.match(/live\.douyin\.com\/(\d+)/)?.[1] ?? null; this.db.prepare(`INSERT INTO capture_sessions VALUES(?,?,?,?,NULL,'connecting',0,0)`).run(id, roomUrl, roomId, now); return { id, roomUrl, roomId, startedAt: now, stoppedAt: null, status: 'connecting', messageCount: 0, reconnectCount: 0 } }
   setSession(id: string, status: Status, reconnectCount?: number) { this.db.prepare(`UPDATE capture_sessions SET status=?, reconnect_count=COALESCE(?,reconnect_count), stopped_at=CASE WHEN ? IN ('stopped','error') THEN ? ELSE stopped_at END WHERE id=?`).run(status, reconnectCount ?? null, status, Date.now(), id) }
   addFrame(sessionId: string, frame: Buffer, saveRaw: boolean) { if (!saveRaw) return null; const hash = createHash('sha256').update(frame).digest('hex'); const result = this.db.prepare(`INSERT OR IGNORE INTO raw_ws_frames(session_id,received_at_ms,sha256,payload) VALUES(?,?,?,?)`).run(sessionId, Date.now(), hash, frame); return Number(result.lastInsertRowid) || null }
-  addMessages(sessionId: string, messages: ReturnType<typeof decodeDanmu>, rawFrameId: number | null): Danmu[] {
+  addMessages(sessionId: string, messages: DecodedDanmu[], rawFrameId: number | null): Danmu[] {
     const saved: Danmu[] = []; const insert = this.db.prepare(`INSERT OR IGNORE INTO danmu_messages(session_id,message_id,user_id,username,sent_at_ms,received_at_ms,content,raw_frame_id) VALUES(?,?,?,?,?,?,?,?)`)
     const now = Date.now(); for (const message of messages) { const result = insert.run(sessionId, message.messageId, message.userId, message.username, message.sentAtMs, now, message.content, rawFrameId); if (result.changes) saved.push({ id: Number(result.lastInsertRowid), sessionId, receivedAtMs: now, ...message }) }
     if (saved.length) this.db.prepare(`UPDATE capture_sessions SET message_count=message_count+? WHERE id=?`).run(saved.length, sessionId)
@@ -83,6 +96,7 @@ class Store {
   }
   session(id: string): Session | null { const row = this.db.prepare(`SELECT id,room_url roomUrl,room_id roomId,started_at startedAt,stopped_at stoppedAt,status,message_count messageCount,reconnect_count reconnectCount FROM capture_sessions WHERE id=?`).get(id) as Session | undefined; return row ?? null }
   sessions(): Session[] { return this.db.prepare(`SELECT id,room_url roomUrl,room_id roomId,started_at startedAt,stopped_at stoppedAt,status,message_count messageCount,reconnect_count reconnectCount FROM capture_sessions ORDER BY started_at DESC`).all() as Session[] }
+  recoverInterruptedSessions() { this.db.prepare(`UPDATE capture_sessions SET status='stopped', stopped_at=COALESCE(stopped_at, ?) WHERE status IN ('connecting','capturing','reconnecting')`).run(Date.now()) }
   messages(sessionId: string, query = '', from?: number, to?: number): Danmu[] { const clauses = ['session_id=?']; const values: (string | number)[] = [sessionId]; if (query) { clauses.push(`(content LIKE ? OR username LIKE ? OR user_id LIKE ?)`); values.push(`%${query}%`, `%${query}%`, `%${query}%`) } if (from) { clauses.push('sent_at_ms>=?'); values.push(from) } if (to) { clauses.push('sent_at_ms<=?'); values.push(to) } return this.db.prepare(`SELECT id,session_id sessionId,message_id messageId,user_id userId,username,sent_at_ms sentAtMs,received_at_ms receivedAtMs,content FROM danmu_messages WHERE ${clauses.join(' AND ')} ORDER BY sent_at_ms DESC LIMIT 10000`).all(...values) as Danmu[] }
   checkpoint() { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE)') }
 }
@@ -137,9 +151,37 @@ class Collector extends EventEmitter {
   }
   private attach(url: string) { return new Promise<void>((resolve, reject) => {
     if (!this.active) return resolve(); const socket = new WebSocket(url); this.active.socket = socket; let nextId = 1; let opened = false; let settled = false
-    const finish = (error?: Error) => { if (settled) return; settled = true; error ? reject(error) : resolve() }
+    const fetchRequests = new Set<string>(); const responseBodyCommands = new Set<number>(); let fetchResponses = 0; let transportPackets = 0; let decodedMessages = 0
+    const warnTimer = setTimeout(() => {
+      if (!this.active || decodedMessages) return
+      if (fetchResponses && !transportPackets) this.emit('error', '已连接直播页，但抖音没有下发弹幕数据。请在“设置”中关闭静默抓取，完成一次登录或安全验证后再重试。')
+      else if (transportPackets) this.emit('error', '已收到直播数据，但其中暂未包含可解析的聊天消息；请确认直播间正在有人发言。')
+    }, 25000)
+    const finish = (error?: Error) => { if (settled) return; settled = true; clearTimeout(warnTimer); error ? reject(error) : resolve() }
+    const save = (bytes: Buffer, messages: DecodedDanmu[]) => {
+      if (!this.active) return
+      transportPackets += 1
+      const rawFrameId = this.store.addFrame(this.active.session.id, bytes, this.store.settings().storeRawFrames)
+      const saved = this.store.addMessages(this.active.session.id, messages, rawFrameId); decodedMessages += saved.length
+      for (const item of saved) this.emit('danmu', item)
+    }
     socket.addEventListener('open', () => { opened = true; socket.send(JSON.stringify({ id: nextId++, method: 'Network.enable' })) })
-    socket.addEventListener('message', ({ data }) => { try { const payload = JSON.parse(String(data)); if (payload.method !== 'Network.webSocketFrameReceived' || !this.active) return; const frame = payload.params.response; if (frame.opcode !== 2) return; const bytes = Buffer.from(frame.payloadData, 'base64'); const rawFrameId = this.store.addFrame(this.active.session.id, bytes, this.store.settings().storeRawFrames); const saved = this.store.addMessages(this.active.session.id, decodeDanmu(bytes), rawFrameId); for (const item of saved) this.emit('danmu', item) } catch (error) { finish(new Error(`WebSocket 帧处理失败：${error instanceof Error ? error.message : String(error)}`)) } })
+    socket.addEventListener('message', ({ data }) => { try {
+      const payload = JSON.parse(String(data))
+      if (responseBodyCommands.delete(payload.id)) {
+        const body = payload.result?.body
+        if (body) save(Buffer.from(body, payload.result.base64Encoded ? 'base64' : 'utf8'), decodeHttpDanmu(Buffer.from(body, payload.result.base64Encoded ? 'base64' : 'utf8')))
+        return
+      }
+      if (payload.method === 'Network.webSocketFrameReceived' && this.active) {
+        const frame = payload.params.response; if (frame.opcode !== 2) return
+        const bytes = Buffer.from(frame.payloadData, 'base64'); save(bytes, decodeDanmu(bytes)); return
+      }
+      if (payload.method === 'Network.responseReceived' && payload.params.response?.url?.includes('/webcast/im/fetch')) fetchRequests.add(payload.params.requestId)
+      if (payload.method === 'Network.loadingFinished' && fetchRequests.delete(payload.params.requestId)) {
+        fetchResponses += 1; const id = nextId++; responseBodyCommands.add(id); socket.send(JSON.stringify({ id, method: 'Network.getResponseBody', params: { requestId: payload.params.requestId } }))
+      }
+    } catch (error) { finish(new Error(`直播数据处理失败：${error instanceof Error ? error.message : String(error)}`)) } })
     socket.addEventListener('close', () => finish(opened ? undefined : new Error('无法连接 Chrome DevTools WebSocket')))
     socket.addEventListener('error', () => finish(new Error('Chrome DevTools WebSocket 连接异常')))
   }) }
@@ -149,7 +191,7 @@ let window: BrowserWindow | null = null; let store: Store; let collector: Collec
 function createWindow() { window = new BrowserWindow({ width: 1380, height: 900, minWidth: 1080, minHeight: 700, webPreferences: { preload: join(__dirname, '../preload/index.mjs'), contextIsolation: true, sandbox: false } }); if (process.env.ELECTRON_RENDERER_URL) window.loadURL(process.env.ELECTRON_RENDERER_URL); else window.loadFile(join(__dirname, '../renderer/index.html')) }
 
 app.whenReady().then(async () => {
-  await mkdir(dataDir(), { recursive: true }); store = new Store(dbPath()); collector = new Collector(store); createWindow()
+  await mkdir(dataDir(), { recursive: true }); store = new Store(dbPath()); store.recoverInterruptedSessions(); collector = new Collector(store); createWindow()
   collector.on('danmu', (item) => window?.webContents.send('danmu:new', item)); collector.on('status', (item) => window?.webContents.send('capture:status', item)); collector.on('error', (item) => window?.webContents.send('capture:error', item))
   ipcMain.handle('app:bootstrap', () => ({ settings: store.settings(), sessions: store.sessions(), active: null, dbPath: dbPath() }))
   ipcMain.handle('capture:start', (_event, url: string) => collector.start(url)); ipcMain.handle('capture:stop', () => collector.stop()); ipcMain.handle('sessions:list', () => store.sessions()); ipcMain.handle('messages:list', (_event, args) => store.messages(args.sessionId, args.query, args.from, args.to)); ipcMain.handle('settings:save', (_event, value: Settings) => store.saveSettings(value)); ipcMain.handle('path:openData', () => shell.openPath(dataDir()))
