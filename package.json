@@ -1,6 +1,6 @@
 {
   "name": "douyin-danmu-desktop",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "本地抖音直播弹幕采集、导出与关键词云桌面应用",
   "main": "./out/main/index.js",
   "type": "module",

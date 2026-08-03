@@ -149,12 +149,12 @@ class Collector extends EventEmitter {
     const debugUrl = this.debugUrl()
     const profile = join(app.getPath('userData'), 'chrome-profile'); await mkdir(profile, { recursive: true })
     const chromeArgs = ['--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', roomUrl]
-    if (this.store.settings().headlessChrome) {
-      const executable = process.platform === 'darwin' ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome' : 'google-chrome'
-      spawn(executable, ['--headless=new', '--disable-gpu', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
-    } else {
-      spawn('open', ['-na', 'Google Chrome', '--args', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
-    }
+    // Douyin serves the live WebSocket stream to a regular Chrome page but can
+    // downgrade headless Chromium to empty polling responses. On macOS, `-g`
+    // starts a normal Chrome in the background so the collector stays quiet
+    // without sacrificing the live transport.
+    const backgroundArgs = this.store.settings().headlessChrome ? ['-g', '-n'] : ['-n']
+    spawn('open', [...backgroundArgs, '-a', 'Google Chrome', '--args', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
     for (let i = 0; i < 20; i += 1) { await new Promise((resolve) => setTimeout(resolve, 500)); try { if ((await fetch(`${debugUrl}/json/version`)).ok) return } catch { /* retry */ } }
     throw new Error('无法启动调试 Chrome，请确认 Google Chrome 已安装')
   }
