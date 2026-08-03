@@ -4,6 +4,7 @@ const api = {
   bootstrap: () => ipcRenderer.invoke('app:bootstrap'),
   start: (url: string) => ipcRenderer.invoke('capture:start', url),
   stop: () => ipcRenderer.invoke('capture:stop'),
+  openLogin: (url: string) => ipcRenderer.invoke('capture:openLogin', url),
   sessions: () => ipcRenderer.invoke('sessions:list'),
   messages: (args: { sessionId: string; query?: string; from?: number; to?: number }) => ipcRenderer.invoke('messages:list', args),
   saveSettings: (settings: unknown) => ipcRenderer.invoke('settings:save', settings),

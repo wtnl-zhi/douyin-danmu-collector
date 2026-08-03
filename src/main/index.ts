@@ -112,8 +112,32 @@ class Collector extends EventEmitter {
     const session = this.store.createSession(roomUrl); this.active = { session, stopped: false, retry: 0 }; this.emit('status', this.store.session(session.id)); void this.loop(); return session
   }
   async stop() { if (!this.active) return null; this.active.stopped = true; this.active.socket?.close(); this.store.setSession(this.active.session.id, 'stopped'); const result = this.store.session(this.active.session.id); this.active = null; this.emit('status', result); return result }
+  async openLogin(roomUrl: string) {
+    if (!/^https:\/\/live\.douyin\.com\/\d+/.test(roomUrl)) throw new Error('请先填写有效的抖音直播间链接')
+    await this.stop(); await this.closeManagedChrome()
+    this.activeCdpPort = CDP_PORT
+    const profile = join(app.getPath('userData'), 'chrome-profile'); await mkdir(profile, { recursive: true })
+    const chromeArgs = ['--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', roomUrl]
+    spawn('open', ['-na', 'Google Chrome', '--args', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
+    for (let i = 0; i < 20; i += 1) { await new Promise((resolve) => setTimeout(resolve, 500)); if (await this.chromeReady(CDP_PORT)) return true }
+    throw new Error('无法打开登录 Chrome，请确认 Google Chrome 已安装')
+  }
   private debugUrl(port = this.activeCdpPort) { return `http://127.0.0.1:${port}` }
   private async chromeReady(port: number) { try { return (await fetch(`${this.debugUrl(port)}/json/version`)).ok } catch { return false } }
+  private async closeManagedChrome() {
+    if (!(await this.chromeReady(CDP_PORT))) return
+    try {
+      const version = await (await fetch(`${this.debugUrl(CDP_PORT)}/json/version`)).json() as { webSocketDebuggerUrl?: string }
+      if (!version.webSocketDebuggerUrl) return
+      await new Promise<void>((resolve) => {
+        const socket = new WebSocket(version.webSocketDebuggerUrl!); const timer = setTimeout(() => { socket.close(); resolve() }, 2500)
+        const done = () => { clearTimeout(timer); resolve() }
+        socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method: 'Browser.close' })))
+        socket.addEventListener('close', done); socket.addEventListener('error', done)
+      })
+    } catch { /* The following launch will report a usable error if Chrome did not exit. */ }
+    for (let i = 0; i < 10 && await this.chromeReady(CDP_PORT); i += 1) await new Promise((resolve) => setTimeout(resolve, 300))
+  }
   private async ensureChrome(roomUrl: string) {
     if (await this.chromeReady(CDP_PORT)) { this.activeCdpPort = CDP_PORT; return }
     // Builds before 0.1.3 used port 9222 with this exact app profile. Reusing that
@@ -194,7 +218,7 @@ app.whenReady().then(async () => {
   await mkdir(dataDir(), { recursive: true }); store = new Store(dbPath()); store.recoverInterruptedSessions(); collector = new Collector(store); createWindow()
   collector.on('danmu', (item) => window?.webContents.send('danmu:new', item)); collector.on('status', (item) => window?.webContents.send('capture:status', item)); collector.on('error', (item) => window?.webContents.send('capture:error', item))
   ipcMain.handle('app:bootstrap', () => ({ settings: store.settings(), sessions: store.sessions(), active: null, dbPath: dbPath() }))
-  ipcMain.handle('capture:start', (_event, url: string) => collector.start(url)); ipcMain.handle('capture:stop', () => collector.stop()); ipcMain.handle('sessions:list', () => store.sessions()); ipcMain.handle('messages:list', (_event, args) => store.messages(args.sessionId, args.query, args.from, args.to)); ipcMain.handle('settings:save', (_event, value: Settings) => store.saveSettings(value)); ipcMain.handle('path:openData', () => shell.openPath(dataDir()))
+  ipcMain.handle('capture:start', (_event, url: string) => collector.start(url)); ipcMain.handle('capture:stop', () => collector.stop()); ipcMain.handle('capture:openLogin', (_event, url: string) => collector.openLogin(url)); ipcMain.handle('sessions:list', () => store.sessions()); ipcMain.handle('messages:list', (_event, args) => store.messages(args.sessionId, args.query, args.from, args.to)); ipcMain.handle('settings:save', (_event, value: Settings) => store.saveSettings(value)); ipcMain.handle('path:openData', () => shell.openPath(dataDir()))
   ipcMain.handle('export:csv', async (_event, sessionId: string) => exportRows(sessionId, 'csv')); ipcMain.handle('export:xlsx', async (_event, sessionId: string) => exportRows(sessionId, 'xlsx')); ipcMain.handle('export:sqlite', async () => { const pick = await dialog.showSaveDialog({ defaultPath: 'danmu.sqlite' }); if (pick.canceled || !pick.filePath) return null; store.checkpoint(); await copyFile(dbPath(), pick.filePath); return pick.filePath }); ipcMain.handle('wordcloud:create', (_event, args) => wordCloud(args.sessionId, args.minFrequency ?? 2)); ipcMain.handle('wordcloud:export', async (_event, args) => exportWordCloudCanvas(args.sessionId, args.minFrequency ?? 2))
 })
 
