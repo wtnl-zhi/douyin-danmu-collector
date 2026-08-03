@@ -2,7 +2,6 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { DatabaseSync } from 'node:sqlite'
 import { EventEmitter } from 'node:events'
 import { createHash, randomUUID } from 'node:crypto'
-import { spawn } from 'node:child_process'
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { gunzipSync } from 'node:zlib'
@@ -14,8 +13,8 @@ type Session = { id: string; roomUrl: string; roomId: string | null; startedAt: 
 type Settings = { maskIds: boolean; newestFirst: boolean; blockedWords: string[]; storeRawFrames: boolean; headlessChrome: boolean }
 
 const DEFAULT_SETTINGS: Settings = { maskIds: true, newestFirst: true, blockedWords: [], storeRawFrames: true, headlessChrome: true }
-const CDP_PORT = 9223
-const LEGACY_CDP_PORTS = [9222]
+const CAPTURE_PARTITION = 'persist:douyin-capture'
+const CHROME_USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
 const dataDir = () => join(app.getPath('userData'), 'data')
 const dbPath = () => join(dataDir(), 'danmu.sqlite')
 
@@ -102,112 +101,83 @@ class Store {
 }
 
 class Collector extends EventEmitter {
-  private active: { session: Session; stopped: boolean; socket?: WebSocket; retry: number } | null = null
-  private activeCdpPort = CDP_PORT
+  private active: { session: Session; stopped: boolean; browser?: BrowserWindow; retry: number } | null = null
   constructor(private store: Store) { super() }
   async start(roomUrl: string) {
     if (this.active) throw new Error('已有抓取任务正在运行')
     if (!/^https:\/\/live\.douyin\.com\/\d+/.test(roomUrl)) throw new Error('请输入有效的抖音直播间链接')
-    this.activeCdpPort = CDP_PORT
     const session = this.store.createSession(roomUrl); this.active = { session, stopped: false, retry: 0 }; this.emit('status', this.store.session(session.id)); void this.loop(); return session
   }
-  async stop() { if (!this.active) return null; this.active.stopped = true; this.active.socket?.close(); this.store.setSession(this.active.session.id, 'stopped'); const result = this.store.session(this.active.session.id); this.active = null; this.emit('status', result); return result }
+  async stop() {
+    if (!this.active) return null
+    const active = this.active; active.stopped = true
+    if (active.browser && !active.browser.isDestroyed()) active.browser.destroy()
+    this.store.setSession(active.session.id, 'stopped'); const result = this.store.session(active.session.id); this.active = null; this.emit('status', result); return result
+  }
   async openLogin(roomUrl: string) {
     if (!/^https:\/\/live\.douyin\.com\/\d+/.test(roomUrl)) throw new Error('请先填写有效的抖音直播间链接')
-    await this.stop(); await this.closeManagedChrome()
-    this.activeCdpPort = CDP_PORT
-    const profile = join(app.getPath('userData'), 'chrome-profile'); await mkdir(profile, { recursive: true })
-    const chromeArgs = ['--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', roomUrl]
-    spawn('open', ['-na', 'Google Chrome', '--args', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
-    for (let i = 0; i < 20; i += 1) { await new Promise((resolve) => setTimeout(resolve, 500)); if (await this.chromeReady(CDP_PORT)) return true }
-    throw new Error('无法打开登录 Chrome，请确认 Google Chrome 已安装')
-  }
-  private debugUrl(port = this.activeCdpPort) { return `http://127.0.0.1:${port}` }
-  private async chromeReady(port: number) { try { return (await fetch(`${this.debugUrl(port)}/json/version`)).ok } catch { return false } }
-  private async closeManagedChrome() {
-    if (!(await this.chromeReady(CDP_PORT))) return
-    try {
-      const version = await (await fetch(`${this.debugUrl(CDP_PORT)}/json/version`)).json() as { webSocketDebuggerUrl?: string }
-      if (!version.webSocketDebuggerUrl) return
-      await new Promise<void>((resolve) => {
-        const socket = new WebSocket(version.webSocketDebuggerUrl!); const timer = setTimeout(() => { socket.close(); resolve() }, 2500)
-        const done = () => { clearTimeout(timer); resolve() }
-        socket.addEventListener('open', () => socket.send(JSON.stringify({ id: 1, method: 'Browser.close' })))
-        socket.addEventListener('close', done); socket.addEventListener('error', done)
-      })
-    } catch { /* The following launch will report a usable error if Chrome did not exit. */ }
-    for (let i = 0; i < 10 && await this.chromeReady(CDP_PORT); i += 1) await new Promise((resolve) => setTimeout(resolve, 300))
-  }
-  private async ensureChrome(roomUrl: string) {
-    if (await this.chromeReady(CDP_PORT)) { this.activeCdpPort = CDP_PORT; return }
-    // Builds before 0.1.3 used port 9222 with this exact app profile. Reusing that
-    // live process avoids a Chromium profile-lock collision after an upgrade.
-    for (const legacyPort of LEGACY_CDP_PORTS) {
-      if (await this.chromeReady(legacyPort)) { this.activeCdpPort = legacyPort; return }
-    }
-    this.activeCdpPort = CDP_PORT
-    const debugUrl = this.debugUrl()
-    const profile = join(app.getPath('userData'), 'chrome-profile'); await mkdir(profile, { recursive: true })
-    const chromeArgs = ['--remote-debugging-address=127.0.0.1', `--remote-debugging-port=${CDP_PORT}`, `--user-data-dir=${profile}`, '--no-first-run', '--no-default-browser-check', roomUrl]
-    // Douyin serves the live WebSocket stream to a regular Chrome page but can
-    // downgrade headless Chromium to empty polling responses. On macOS, `-g`
-    // starts a normal Chrome in the background so the collector stays quiet
-    // without sacrificing the live transport.
-    const backgroundArgs = this.store.settings().headlessChrome ? ['-g', '-j', '-n'] : ['-n']
-    spawn('open', [...backgroundArgs, '-a', 'Google Chrome', '--args', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
-    for (let i = 0; i < 20; i += 1) { await new Promise((resolve) => setTimeout(resolve, 500)); try { if ((await fetch(`${debugUrl}/json/version`)).ok) return } catch { /* retry */ } }
-    throw new Error('无法启动调试 Chrome，请确认 Google Chrome 已安装')
-  }
-  private async target(roomUrl: string): Promise<{ webSocketDebuggerUrl: string }> {
-    const debugUrl = this.debugUrl()
-    const tabs = await (await fetch(`${debugUrl}/json/list`)).json() as Array<{ type: string; url: string; webSocketDebuggerUrl?: string }>
-    let tab = tabs.find((item) => item.type === 'page' && item.url.includes('live.douyin.com'))
-    if (!tab) { await fetch(`${debugUrl}/json/new?${encodeURIComponent(roomUrl)}`, { method: 'PUT' }); await new Promise((resolve) => setTimeout(resolve, 1000)); return this.target(roomUrl) }
-    if (!tab.webSocketDebuggerUrl) throw new Error('直播页面调试接口不可用'); return { webSocketDebuggerUrl: tab.webSocketDebuggerUrl }
+    await this.stop()
+    const login = new BrowserWindow({ width: 1280, height: 820, minWidth: 960, minHeight: 650, title: '登录抖音后返回采集器', webPreferences: { partition: CAPTURE_PARTITION, contextIsolation: true, sandbox: true } })
+    login.webContents.setUserAgent(CHROME_USER_AGENT)
+    await login.loadURL(roomUrl)
+    return true
   }
   private async loop() {
     while (this.active && !this.active.stopped) {
-      try { await this.ensureChrome(this.active.session.roomUrl); const target = await this.target(this.active.session.roomUrl); this.store.setSession(this.active.session.id, 'capturing', this.active.retry); this.emit('status', this.store.session(this.active.session.id)); await this.attach(target.webSocketDebuggerUrl) }
-      catch (error) { if (!this.active) return; this.active.retry += 1; this.store.setSession(this.active.session.id, 'reconnecting', this.active.retry); this.emit('error', error instanceof Error ? error.message : String(error)); this.emit('status', this.store.session(this.active.session.id)) }
+      try {
+        this.store.setSession(this.active.session.id, 'capturing', this.active.retry); this.emit('status', this.store.session(this.active.session.id))
+        await this.capture(this.active.session.roomUrl)
+      } catch (error) {
+        if (!this.active) return
+        this.active.retry += 1; this.store.setSession(this.active.session.id, 'reconnecting', this.active.retry)
+        this.emit('error', error instanceof Error ? error.message : String(error)); this.emit('status', this.store.session(this.active.session.id))
+      }
       const active = this.active
       if (active && !active.stopped) await new Promise((resolve) => setTimeout(resolve, Math.min(1000 * 2 ** active.retry, 30000)))
     }
   }
-  private attach(url: string) { return new Promise<void>((resolve, reject) => {
-    if (!this.active) return resolve(); const socket = new WebSocket(url); this.active.socket = socket; let nextId = 1; let opened = false; let settled = false
-    const fetchRequests = new Set<string>(); const responseBodyCommands = new Set<number>(); let fetchResponses = 0; let transportPackets = 0; let decodedMessages = 0
-    const warnTimer = setTimeout(() => {
-      if (!this.active || decodedMessages) return
-      if (fetchResponses && !transportPackets) this.emit('error', '已连接直播页，但抖音没有下发弹幕数据。请在“设置”中关闭静默抓取，完成一次登录或安全验证后再重试。')
-      else if (transportPackets) this.emit('error', '已收到直播数据，但其中暂未包含可解析的聊天消息；请确认直播间正在有人发言。')
-    }, 25000)
-    const finish = (error?: Error) => { if (settled) return; settled = true; clearTimeout(warnTimer); error ? reject(error) : resolve() }
+  private capture(roomUrl: string) { return new Promise<void>((resolve, reject) => {
+    if (!this.active) return resolve()
+    const hidden = new BrowserWindow({ show: false, webPreferences: { partition: CAPTURE_PARTITION, contextIsolation: true, sandbox: true } })
+    this.active.browser = hidden; hidden.webContents.setUserAgent(CHROME_USER_AGENT)
+    const fetchRequests = new Set<string>(); let transportPackets = 0; let decodedMessages = 0; let settled = false
+    const finish = (error?: Error) => {
+      if (settled) return; settled = true; clearTimeout(warnTimer)
+      if (hidden.webContents.debugger.isAttached()) hidden.webContents.debugger.detach()
+      if (this.active?.browser === hidden) this.active.browser = undefined
+      error ? reject(error) : resolve()
+    }
     const save = (bytes: Buffer, messages: DecodedDanmu[]) => {
-      if (!this.active) return
-      transportPackets += 1
-      const rawFrameId = this.store.addFrame(this.active.session.id, bytes, this.store.settings().storeRawFrames)
+      if (!this.active || this.active.browser !== hidden) return
+      transportPackets += 1; const rawFrameId = this.store.addFrame(this.active.session.id, bytes, this.store.settings().storeRawFrames)
       const saved = this.store.addMessages(this.active.session.id, messages, rawFrameId); decodedMessages += saved.length
       for (const item of saved) this.emit('danmu', item)
     }
-    socket.addEventListener('open', () => { opened = true; socket.send(JSON.stringify({ id: nextId++, method: 'Network.enable' })) })
-    socket.addEventListener('message', ({ data }) => { try {
-      const payload = JSON.parse(String(data))
-      if (responseBodyCommands.delete(payload.id)) {
-        const body = payload.result?.body
-        if (body) save(Buffer.from(body, payload.result.base64Encoded ? 'base64' : 'utf8'), decodeHttpDanmu(Buffer.from(body, payload.result.base64Encoded ? 'base64' : 'utf8')))
-        return
-      }
-      if (payload.method === 'Network.webSocketFrameReceived' && this.active) {
-        const frame = payload.params.response; if (frame.opcode !== 2) return
-        const bytes = Buffer.from(frame.payloadData, 'base64'); save(bytes, decodeDanmu(bytes)); return
-      }
-      if (payload.method === 'Network.responseReceived' && payload.params.response?.url?.includes('/webcast/im/fetch')) fetchRequests.add(payload.params.requestId)
-      if (payload.method === 'Network.loadingFinished' && fetchRequests.delete(payload.params.requestId)) {
-        fetchResponses += 1; const id = nextId++; responseBodyCommands.add(id); socket.send(JSON.stringify({ id, method: 'Network.getResponseBody', params: { requestId: payload.params.requestId } }))
-      }
-    } catch (error) { finish(new Error(`直播数据处理失败：${error instanceof Error ? error.message : String(error)}`)) } })
-    socket.addEventListener('close', () => finish(opened ? undefined : new Error('无法连接 Chrome DevTools WebSocket')))
-    socket.addEventListener('error', () => finish(new Error('Chrome DevTools WebSocket 连接异常')))
+    const warnTimer = setTimeout(() => {
+      if (!this.active || this.active.browser !== hidden || decodedMessages) return
+      if (!transportPackets) this.emit('error', '未收到抖音弹幕数据。请点击“打开登录窗口”完成登录或安全验证后重试。')
+      else this.emit('error', '已收到直播数据，但其中暂未包含可解析的聊天消息；请确认直播间正在有人发言。')
+    }, 25000)
+    try {
+      hidden.webContents.debugger.attach('1.3')
+      hidden.webContents.debugger.on('message', (_event, method, params) => {
+        try {
+          if (method === 'Network.webSocketFrameReceived') {
+            const frame = params.response; if (frame?.opcode === 2) save(Buffer.from(frame.payloadData, 'base64'), decodeDanmu(Buffer.from(frame.payloadData, 'base64')))
+          }
+          if (method === 'Network.responseReceived' && params.response?.url?.includes('/webcast/im/fetch')) fetchRequests.add(params.requestId)
+          if (method === 'Network.loadingFinished' && fetchRequests.delete(params.requestId)) {
+            void hidden.webContents.debugger.sendCommand('Network.getResponseBody', { requestId: params.requestId }).then((result: { body?: string; base64Encoded?: boolean }) => {
+              if (!result.body) return; const bytes = Buffer.from(result.body, result.base64Encoded ? 'base64' : 'utf8'); save(bytes, decodeHttpDanmu(bytes))
+            }).catch(() => undefined)
+          }
+        } catch (error) { finish(new Error(`直播数据处理失败：${error instanceof Error ? error.message : String(error)}`)) }
+      })
+      void hidden.webContents.debugger.sendCommand('Network.enable')
+      hidden.webContents.once('render-process-gone', () => finish(new Error('隐藏采集窗口意外退出')))
+      hidden.once('closed', () => finish())
+      void hidden.loadURL(roomUrl).catch((error) => finish(new Error(`无法打开直播间：${error instanceof Error ? error.message : String(error)}`)))
+    } catch (error) { finish(new Error(`无法启动隐藏采集窗口：${error instanceof Error ? error.message : String(error)}`)) }
   }) }
 }
 
