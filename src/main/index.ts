@@ -153,7 +153,7 @@ class Collector extends EventEmitter {
     // downgrade headless Chromium to empty polling responses. On macOS, `-g`
     // starts a normal Chrome in the background so the collector stays quiet
     // without sacrificing the live transport.
-    const backgroundArgs = this.store.settings().headlessChrome ? ['-g', '-n'] : ['-n']
+    const backgroundArgs = this.store.settings().headlessChrome ? ['-g', '-j', '-n'] : ['-n']
     spawn('open', [...backgroundArgs, '-a', 'Google Chrome', '--args', ...chromeArgs], { detached: true, stdio: 'ignore' }).unref()
     for (let i = 0; i < 20; i += 1) { await new Promise((resolve) => setTimeout(resolve, 500)); try { if ((await fetch(`${debugUrl}/json/version`)).ok) return } catch { /* retry */ } }
     throw new Error('无法启动调试 Chrome，请确认 Google Chrome 已安装')
